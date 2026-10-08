@@ -70,6 +70,7 @@ PIDNET_ZIP_ID = "1iSXovLQXDXlwltXgEHdKlrUdb3kM06tg"
 
 BEST_STG1_ID = "1KAl_I7tOBeoUfz29PxHCNg64TRso5QWI"
 PIDNET_MODEL_ID = "17NF9dZj44dLT_8ZNJ6TeU0niMdgB8I2h"
+SAMPLE_VIDEO_ID = "1sNnRRm0syT-G5WdypUIauL7XKXuwN_SP"
 
 
 # --------------------------------------------------
@@ -177,6 +178,14 @@ def install_checkpoints():
 
 
 # --------------------------------------------------
+# Download sample video into the project root
+# --------------------------------------------------
+def install_sample_video():
+    sample_video = BASE_DIR / "sample-video.mp4"
+    download_file(SAMPLE_VIDEO_ID, sample_video)
+
+
+# --------------------------------------------------
 # Main
 # --------------------------------------------------
 def main():
@@ -185,7 +194,7 @@ def main():
     print("SPDS ASSET INSTALLER")
     print("=" * 60)
 
-    print("\nSTEP 1/2 : Installing project folders")
+    print("\nSTEP 1/3 : Installing project folders")
     install_main_folders()
 
     if not (BASE_DIR / "D-FINE-OFFICIAL").exists():
@@ -194,8 +203,11 @@ def main():
     if not (BASE_DIR / "PIDNet").exists():
         print("[WARNING] PIDNet folder missing after step 1.")
 
-    print("\nSTEP 2/2 : Installing checkpoints")
+    print("\nSTEP 2/3 : Installing checkpoints")
     install_checkpoints()
+
+    print("\nSTEP 3/3 : Installing sample video")
+    install_sample_video()
 
     print("\n" + "=" * 60)
     print("INSTALLATION COMPLETE")
