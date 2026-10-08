@@ -27,6 +27,13 @@ import sys
 import time
 import argparse
 import logging
+import subprocess
+import csv
+import uuid
+import secrets
+import os
+import string
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Tuple, List, Dict, Union, Optional, Any
 
@@ -84,6 +91,10 @@ OFFROAD_OBSTACLE_CLASSES = {2, 3, 4, 5, 6, 7, 8, 10}  # Buildings, Walls, Fences
 # Normalization constants for PIDNet (ImageNet standard)
 PIDNET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 PIDNET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+
+# Fallback estimate for videos without a camera/scene calibration. This is a
+# rough prior only; PIXELS_PER_CM or --pixels-per-cm can override it.
+DEFAULT_PIXELS_PER_CM = 3.0
 
 
 # ============================================================================
@@ -387,6 +398,62 @@ class VerificationResult:
         self.sky_veg_ratio = sky_veg_ratio
         self.accepted = accepted
         self.reason = reason
+
+
+DETECTION_CSV_FIELDS = [
+    "detection_id", "device_id", "vehicle_id", "detected_at", "latitude", "longitude",
+    "length_cm", "width_cm", "depth_cm", "severity", "confidence", "model_version",
+    "image_s3_key", "frame_number", "video_time_seconds", "accepted", "decision_reason",
+    "bbox_width_px", "bbox_height_px", "bbox_area_px", "size_estimate_scale_px_per_cm",
+    "road_ratio", "sky_veg_ratio",
+]
+RDS_CSV_FIELDS = [
+    "detection_id", "device_id", "vehicle_id", "detected_at", "latitude", "longitude",
+    "length_cm", "width_cm", "depth_cm", "severity", "confidence", "model_version",
+    "image_s3_key",
+]
+
+
+def write_detection_rows(
+    writer, rds_writer, results, frame_bgr, frame_idx, fps, run_started_at,
+    device_id, vehicle_id, pixels_per_cm=DEFAULT_PIXELS_PER_CM,
+):
+    """Write one auditable row per candidate that passed D-FINE's confidence threshold."""
+    h, w = frame_bgr.shape[:2]
+    video_seconds = (frame_idx - 1) / fps if fps > 0 else 0.0
+    detected_at = run_started_at + timedelta(seconds=video_seconds)
+    for result in results:
+        b = result.box
+        x1 = max(0, min(w - 1, int(round(b[0]))))
+        y1 = max(0, min(h - 1, int(round(b[1]))))
+        x2 = max(0, min(w, int(round(b[2]))))
+        y2 = max(0, min(h, int(round(b[3]))))
+        box_width = max(0, x2 - x1)
+        box_height = max(0, y2 - y1)
+        # Optional rough estimate, valid only for the calibrated reference plane.
+        estimated_length_cm = estimated_width_cm = ""
+        if pixels_per_cm and pixels_per_cm > 0:
+            estimated_length_cm = f"{max(box_width, box_height) / pixels_per_cm:.1f}"
+            estimated_width_cm = f"{min(box_width, box_height) / pixels_per_cm:.1f}"
+        row = {
+            "detection_id": str(uuid.uuid4()), "device_id": device_id, "vehicle_id": vehicle_id,
+            "detected_at": detected_at.isoformat(timespec="milliseconds"),
+            "latitude": "", "longitude": "", "length_cm": estimated_length_cm,
+            "width_cm": estimated_width_cm,
+            "depth_cm": "", "severity": "", "confidence": f"{result.score:.6f}",
+            "model_version": "DFINE+PIDNet-est", "image_s3_key": "",
+            "frame_number": frame_idx, "video_time_seconds": f"{video_seconds:.3f}",
+            "accepted": str(bool(result.accepted)).lower(),
+            "decision_reason": result.reason,
+            "bbox_width_px": box_width, "bbox_height_px": box_height,
+            "bbox_area_px": box_width * box_height,
+            "size_estimate_scale_px_per_cm": f"{pixels_per_cm:.3f}" if pixels_per_cm else "",
+            "road_ratio": f"{result.road_ratio:.6f}",
+            "sky_veg_ratio": f"{result.sky_veg_ratio:.6f}",
+        }
+        writer.writerow(row)
+        if result.accepted and rds_writer is not None:
+            rds_writer.writerow({field: row[field] for field in RDS_CSV_FIELDS})
 
 
 def verify_detections(
@@ -777,7 +844,8 @@ def process_video(
     conf_threshold: float = 0.50,
     min_road_ratio: float = 0.25,
     show_rejected: bool = False,
-    profiler: Optional[PerformanceProfiler] = None
+    profiler: Optional[PerformanceProfiler] = None,
+    pixels_per_cm: Optional[float] = None,
 ) -> Path:
     """Performs integrated PIDNet + D-FINE verification frame-by-frame on video."""
     video_path = Path(video_path)
@@ -795,7 +863,19 @@ def process_video(
     h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-    output_path = output_dir / f"{video_path.stem}_verified.mp4"
+    output_stem = video_path.stem
+    run_number = 1
+    while any((output_dir / filename).exists() for filename in (
+        f"{output_stem}_verified.mp4",
+        f"{output_stem}_detections.csv",
+        f"{output_stem}_potholes_rds.csv",
+    )):
+        run_number += 1
+        output_stem = f"{video_path.stem}_{run_number}"
+
+    output_path = output_dir / f"{output_stem}_verified.mp4"
+    csv_path = output_dir / f"{output_stem}_detections.csv"
+    rds_csv_path = output_dir / f"{output_stem}_potholes_rds.csv"
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     out = cv2.VideoWriter(str(output_path), fourcc, fps, (w, h))
 
@@ -807,66 +887,82 @@ def process_video(
     total_rejected = 0
     validation_mask_saved = False
     tracker = TemporalPotholeTracker(max_age=15, iou_thresh=0.20)
+    run_started_at = datetime.now(timezone.utc)
+    # Keep each identifier stable within this video run; 128 random bits make
+    # collisions across separate runs extraordinarily unlikely.
+    id_alphabet = string.ascii_letters + string.digits
+    device_id = "".join(secrets.choice(id_alphabet) for _ in range(20))
+    vehicle_id = "".join(secrets.choice(id_alphabet) for _ in range(20))
 
     try:
-        while True:
-            ret, frame_bgr = cap.read()
-            if not ret or frame_bgr is None:
-                break
+        with csv_path.open("w", newline="", encoding="utf-8") as csv_file, \
+                rds_csv_path.open("w", newline="", encoding="utf-8") as rds_csv_file:
+            csv_writer = csv.DictWriter(csv_file, fieldnames=DETECTION_CSV_FIELDS)
+            csv_writer.writeheader()
+            rds_csv_writer = csv.DictWriter(rds_csv_file, fieldnames=RDS_CSV_FIELDS)
+            rds_csv_writer.writeheader()
+            while True:
+                ret, frame_bgr = cap.read()
+                if not ret or frame_bgr is None:
+                    break
 
-            frame_idx += 1
-            t_start = time.perf_counter()
+                frame_idx += 1
+                t_start = time.perf_counter()
 
             # 1. PIDNet ground segmentation & 19-class map
-            t0 = time.perf_counter()
-            road_mask, seg_map = get_road_segmentation(pidnet_model, frame_bgr, device)
-            t_pidnet = time.perf_counter() - t0
+                t0 = time.perf_counter()
+                road_mask, seg_map = get_road_segmentation(pidnet_model, frame_bgr, device)
+                t_pidnet = time.perf_counter() - t0
 
             # Save first frame road mask for validation
-            if not validation_mask_saved:
-                val_mask_path = output_dir / "road_mask_validation.png"
-                save_validation_road_mask(road_mask, val_mask_path)
-                validation_mask_saved = True
+                if not validation_mask_saved:
+                    val_mask_path = output_dir / "road_mask_validation.png"
+                    save_validation_road_mask(road_mask, val_mask_path)
+                    validation_mask_saved = True
 
             # 2. D-FINE inference
-            t0 = time.perf_counter()
-            boxes, scores, labels = run_dfine(dfine_model, frame_bgr, device)
-            t_dfine = time.perf_counter() - t0
+                t0 = time.perf_counter()
+                boxes, scores, labels = run_dfine(dfine_model, frame_bgr, device)
+                t_dfine = time.perf_counter() - t0
 
             # 3. Verification & Temporal Tracking
-            t0 = time.perf_counter()
-            results = verify_detections(
-                boxes, scores, labels, seg_map,
-                conf_threshold=conf_threshold,
-                min_road_ratio=min_road_ratio
-            )
-            results = tracker.update(results, w, h)
-            t_verify = time.perf_counter() - t0
+                t0 = time.perf_counter()
+                results = verify_detections(
+                    boxes, scores, labels, seg_map,
+                    conf_threshold=conf_threshold,
+                    min_road_ratio=min_road_ratio
+                )
+                results = tracker.update(results, w, h)
+                t_verify = time.perf_counter() - t0
+                write_detection_rows(
+                    csv_writer, rds_csv_writer, results, frame_bgr, frame_idx, fps,
+                    run_started_at, device_id, vehicle_id, pixels_per_cm,
+                )
 
-            accepted_in_frame = sum(1 for r in results if r.accepted)
-            rejected_in_frame = len(results) - accepted_in_frame
-            total_accepted += accepted_in_frame
-            total_rejected += rejected_in_frame
+                accepted_in_frame = sum(1 for r in results if r.accepted)
+                rejected_in_frame = len(results) - accepted_in_frame
+                total_accepted += accepted_in_frame
+                total_rejected += rejected_in_frame
 
             # 4. Visualization & write
-            t0 = time.perf_counter()
-            annotated_frame = draw_pipeline_results(
-                frame_bgr, results,
-                show_rejected=show_rejected,
-                blend_road_overlay=False,
-                road_mask=road_mask
-            )
-            out.write(annotated_frame)
-            t_viz = time.perf_counter() - t0
+                t0 = time.perf_counter()
+                annotated_frame = draw_pipeline_results(
+                    frame_bgr, results,
+                    show_rejected=show_rejected,
+                    blend_road_overlay=False,
+                    road_mask=road_mask
+                )
+                out.write(annotated_frame)
+                t_viz = time.perf_counter() - t0
 
-            t_total = time.perf_counter() - t_start
-            if profiler is not None:
-                profiler.record(t_pidnet, t_dfine, t_verify, t_viz, t_total)
+                t_total = time.perf_counter() - t_start
+                if profiler is not None:
+                    profiler.record(t_pidnet, t_dfine, t_verify, t_viz, t_total)
 
-            if frame_idx == 1 or frame_idx % 30 == 0 or frame_idx == total_frames:
-                frame_info = f"{frame_idx}/{total_frames}" if total_frames > 0 else f"{frame_idx}"
-                logger.info("Frame %s | Accepted: %d | Rejected: %d",
-                            frame_info, accepted_in_frame, rejected_in_frame)
+                if frame_idx == 1 or frame_idx % 30 == 0 or frame_idx == total_frames:
+                    frame_info = f"{frame_idx}/{total_frames}" if total_frames > 0 else f"{frame_idx}"
+                    logger.info("Frame %s | Accepted: %d | Rejected: %d",
+                                frame_info, accepted_in_frame, rejected_in_frame)
 
     finally:
         cap.release()
@@ -875,13 +971,32 @@ def process_video(
     logger.info("Finished video processing. Total frames: %d | Total Accepted: %d | Total Rejected: %d",
                 frame_idx, total_accepted, total_rejected)
     logger.info("Output video saved to: %s", output_path)
+    logger.info("Detection CSV saved to: %s", csv_path)
+    logger.info("RDS-ready accepted detections saved to: %s", rds_csv_path)
     return output_path
 
 
 # ============================================================================
 # MAIN ENTRYPOINT
 # ============================================================================
+def load_local_env():
+    """Load optional project .env settings without overriding process variables."""
+    env_path = PROJECT_ROOT / ".env"
+    if not env_path.is_file():
+        return
+    for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key, value = key.strip(), value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+            value = value[1:-1]
+        os.environ.setdefault(key, value)
+
+
 def main():
+    load_local_env()
     parser = argparse.ArgumentParser(
         description="SPDS - PIDNet Road Segmentation + D-FINE Pothole Detection Pipeline"
     )
@@ -928,6 +1043,12 @@ def main():
         help="Minimum road surface pixel ratio to accept pothole (default: 0.20)"
     )
     parser.add_argument(
+        "--pixels-per-cm",
+        type=float,
+        default=None,
+        help="Optional calibrated pixels/cm scale at a reference plane for rough length/width estimates",
+    )
+    parser.add_argument(
         "--show-rejected",
         action="store_true",
         help="Display rejected off-road detections in red for debugging"
@@ -940,6 +1061,18 @@ def main():
     )
 
     args = parser.parse_args()
+    pixels_per_cm = args.pixels_per_cm
+    if pixels_per_cm is None:
+        scale_setting = os.environ.get("PIXELS_PER_CM", "").strip()
+        if scale_setting:
+            try:
+                pixels_per_cm = float(scale_setting)
+            except ValueError:
+                parser.error("PIXELS_PER_CM in .env must be a positive number")
+        else:
+            pixels_per_cm = DEFAULT_PIXELS_PER_CM
+    if pixels_per_cm is not None and pixels_per_cm <= 0:
+        parser.error("--pixels-per-cm / PIXELS_PER_CM must be greater than zero")
 
     logger.info("=" * 65)
     logger.info("SPDS: PIDNet Road Segmentation + D-FINE Pothole Detection")
@@ -1006,7 +1139,7 @@ def main():
         )
 
     for vid_path in videos:
-        process_video(
+        video_output_path = process_video(
             pidnet_model=pidnet_model,
             dfine_model=dfine_model,
             video_path=vid_path,
@@ -1015,8 +1148,20 @@ def main():
             conf_threshold=args.threshold,
             min_road_ratio=args.min_road_ratio,
             show_rejected=args.show_rejected,
-            profiler=profiler
+            profiler=profiler,
+            pixels_per_cm=pixels_per_cm,
         )
+        output_stem = video_output_path.stem[:-len("_verified")]
+        rds_csv_path = output_dir / f"{output_stem}_potholes_rds.csv"
+        uploader_path = SCRIPT_DIR / "push_to_rds.py"
+        logger.info("Starting post-inference RDS upload for %s", rds_csv_path.name)
+        upload_result = subprocess.run(
+            [sys.executable, str(uploader_path), str(rds_csv_path)],
+            check=False,
+        )
+        if upload_result.returncode != 0:
+            logger.error("RDS upload failed for %s (exit code %d)",
+                         rds_csv_path.name, upload_result.returncode)
 
     # Print profiling table
     profiler.print_summary()
